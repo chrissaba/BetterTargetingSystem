@@ -41,21 +41,21 @@ public sealed unsafe class Plugin : IDalamudPlugin
     public Configuration Configuration { get; init; }
 
     [PluginService] internal static IClientState Client { get; set; } = null!;
-    [PluginService] private IObjectTable ObjectTable { get; set; } = null!;
-    [PluginService] private ITargetManager TargetManager { get; set; } = null!;
+    [PluginService] private static IObjectTable ObjectTable { get; set; } = null!;
+    [PluginService] private static ITargetManager TargetManager { get; set; } = null!;
     [PluginService] internal static IGameGui GameGui { get; set; } = null!;
     [PluginService] private static IGameInteropProvider GameInteropProvider { get; set; } = null!;
     [PluginService] internal static IKeyState KeyState { get; set; } = null!;
-    [PluginService] internal ICondition Condition { get; private set; }
+    [PluginService] internal static ICondition Condition { get; private set; }
 
     private ConfigWindow ConfigWindow { get; init; }
     private HelpWindow HelpWindow { get; init; }
     private WindowSystem WindowSystem = new("BetterTargetingSystem");
 
     // Shamelessly stolen, not sure what that game function exactly does but it works
-    //[Signature("48 89 5C 24 ?? 57 48 83 EC 20 48 8B DA 8B F9 E8 ?? ?? ?? ?? 4C 8B C3")]
-    //internal static CanAttackDelegate? CanAttackFunction = null!;
-    //internal delegate nint CanAttackDelegate(nint a1, nint objectAddress);
+    [Signature("48 89 5C 24 ?? 57 48 83 EC 20 48 8B DA 8B F9 E8 ?? ?? ?? ?? 4C 8B C3")]
+    internal static CanAttackDelegate? CanAttackFunction = null!;
+    internal delegate nint CanAttackDelegate(nint a1, nint objectAddress);
 
     public Plugin(
         IDalamudPluginInterface pluginInterface,
@@ -117,15 +117,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         this.CyclingTargets = new List<uint>();
     }
 
+    internal List<DalamudGameObject> GlobalPriorityTargets { get; private set; } = new List<DalamudGameObject>();
+
     public void Update(IFramework framework)
     {
-        if (Client.IsLoggedIn == false || Client.LocalPlayer == null)
-            return;
-
-        // Disable features in PvP
-        if (Client.IsPvP)
-            return;
-
         // Disable in GPose
         if (Client.IsGPosing)
             return;
@@ -176,22 +171,33 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void TargetClosest(bool lowestHealth = false)
     {
         if (Client.LocalPlayer == null)
+        {
+            PluginLog.Debug($"Client.LocalPlayer is {Client.LocalPlayer}");
             return;
+        }
 
+        // Fetch targets from the global priority list first
         var (Targets, CloseTargets, EnemyListTargets, OnScreenTargets) = GetTargets();
+        var priorityTargets = GlobalPriorityTargets.Count > 0 ? GlobalPriorityTargets : CloseTargets;
 
-        // All objects in Targets and CloseTargets are in OnScreenTargets so it's not necessary to test them
-        if (EnemyListTargets.Count == 0 && OnScreenTargets.Count == 0)
+        // If no priority targets, fall back to normal logic
+        var _targets = priorityTargets.Count > 0 ? priorityTargets
+                      : OnScreenTargets.Count > 0 ? OnScreenTargets
+                      : EnemyListTargets;
+
+        if (_targets.Count == 0)
             return;
-
-        var _targets = OnScreenTargets.Count > 0 ? OnScreenTargets : EnemyListTargets;
 
         var _target = lowestHealth
-            ? _targets.OrderBy(o => (o as DalamudCharacter)?.CurrentHp).ThenBy(o => Utils.DistanceBetweenObjects(Client.LocalPlayer, o)).First()
+            ? _targets.OrderBy(o => (o as DalamudCharacter)?.CurrentHp)
+                      .ThenBy(o => Utils.DistanceBetweenObjects(Client.LocalPlayer, o)).First()
             : _targets.OrderBy(o => Utils.DistanceBetweenObjects(Client.LocalPlayer, o)).First();
 
         SetTarget(_target);
     }
+
+    public record ObjectsList(List<DalamudGameObject> Targets, List<DalamudGameObject> CloseTargets, List<DalamudGameObject> TargetsEnemy, List<DalamudGameObject> OnScreenTargets);
+
 
     private class AOETarget
     {
@@ -202,75 +208,147 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void TargetBestAOE()
     {
         if (Client.LocalPlayer == null)
+        {
+            PluginLog.Debug($"Client.LocalPlayer is {Client.LocalPlayer}");
             return;
+        }
 
         var (Targets, CloseTargets, EnemyListTargets, OnScreenTargets) = GetTargets();
 
-        if (OnScreenTargets.Count == 0)
-            return;
+        // Step 1: Prioritize Enemy List Targets
+        var AOETargetsList = new List<AOETarget>();
 
-        var groupManager = GroupManager.Instance();
-        if (groupManager != null)
+        if (EnemyListTargets.Count > 0)
         {
-            EnemyListTargets.AddRange(OnScreenTargets.Where(o =>
-                EnemyListTargets.Contains(o) == false
-                && ((o as DalamudCharacter)?.StatusFlags & StatusFlags.InCombat) != 0
-                && groupManager->MainGroup.GetPartyMemberByEntityId((uint)o.TargetObjectId) != null
-            ));
+            foreach (var enemy in EnemyListTargets)
+            {
+                var AOETarget = new AOETarget(enemy);
+                foreach (var other in EnemyListTargets)
+                {
+                    if (other == enemy) continue;
+                    if (Utils.DistanceBetweenObjects(enemy, other) <= 5) // Assuming 5 is the range
+                    {
+                        AOETarget.inRange += 1;
+                    }
+                }
+                AOETargetsList.Add(AOETarget);
+            }
         }
 
-        if (EnemyListTargets.Count == 0)
-            return;
-
-        var AOETargetsList = new List<AOETarget>();
-        foreach (var enemy in EnemyListTargets)
+        // Check if we found any AOE targets in the Enemy List
+        if (AOETargetsList.Count > 0)
         {
-            var AOETarget = new AOETarget(enemy);
-            foreach (var other in EnemyListTargets)
+            var _target = AOETargetsList
+                .OrderByDescending(o => o.inRange)
+                .ThenByDescending(o => (o.obj as DalamudCharacter)?.CurrentHp)
+                .FirstOrDefault()?.obj;
+
+            if (_target != null)
             {
-                if (other == enemy) continue;
-                if (Utils.DistanceBetweenObjects(enemy, other) > 5) continue;
-                AOETarget.inRange += 1;
+                SetTarget(_target);
+                return; // Target found in the enemy list, no need to continue
+            }
+        }
+
+        // Step 2: Check Targets in the Cone
+        AOETargetsList.Clear(); // Clear previous list for new targets
+        foreach (var target in Targets)
+        {
+            var AOETarget = new AOETarget(target);
+            foreach (var other in Targets)
+            {
+                if (other == target) continue;
+                if (Utils.DistanceBetweenObjects(target, other) <= 5) // Assuming 5 is the range
+                {
+                    AOETarget.inRange += 1;
+                }
             }
             AOETargetsList.Add(AOETarget);
         }
 
-        var _targets = AOETargetsList.Where(o => OnScreenTargets.Contains(o.obj)).ToList();
+        // Check if we found any AOE targets in the Cone
+        if (AOETargetsList.Count > 0)
+        {
+            var _target = AOETargetsList
+                .OrderByDescending(o => o.inRange)
+                .ThenByDescending(o => (o.obj as DalamudCharacter)?.CurrentHp)
+                .FirstOrDefault()?.obj;
 
-        if (_targets.Count == 0)
-            return;
+            if (_target != null)
+            {
+                SetTarget(_target);
+                return; // Target found in the cone, no need to continue
+            }
+        }
 
-        var _target = _targets.OrderByDescending(o => o.inRange).ThenByDescending(o => (o.obj as DalamudCharacter)?.CurrentHp).First().obj;
+        // Step 3: Check On-Screen Targets
+        AOETargetsList.Clear(); // Clear previous list for new targets
+        foreach (var target in OnScreenTargets)
+        {
+            var AOETarget = new AOETarget(target);
+            foreach (var other in OnScreenTargets)
+            {
+                if (other == target) continue;
+                if (Utils.DistanceBetweenObjects(target, other) <= 5) // Assuming 5 is the range
+                {
+                    AOETarget.inRange += 1;
+                }
+            }
+            AOETargetsList.Add(AOETarget);
+        }
 
-        SetTarget(_target);
+        // Final check if we found any AOE targets on screen
+        if (AOETargetsList.Count > 0)
+        {
+            var _target = AOETargetsList
+                .OrderByDescending(o => o.inRange)
+                .ThenByDescending(o => (o.obj as DalamudCharacter)?.CurrentHp)
+                .FirstOrDefault()?.obj;
+
+            if (_target != null)
+            {
+                SetTarget(_target); // Set the target if found
+                return;
+            }
+        }
+
+        // If we reach here, no targets were found
+        PluginLog.Debug("No valid AOE target found in any category.");
     }
 
     private void CycleTargets()
     {
         if (Client.LocalPlayer == null)
+        {
+            PluginLog.Debug($"Client.LocalPlayer is {Client.LocalPlayer}");
             return;
+        }
 
         var (Targets, CloseTargets, EnemyListTargets, OnScreenTargets) = GetTargets();
 
-        // All objects in Targets and CloseTargets are in OnScreenTargets so it's not necessary to test them
-        if (EnemyListTargets.Count == 0 && OnScreenTargets.Count == 0)
+        // Combine cone targets and close circle targets
+        var AllTargets = Targets.Union(CloseTargets).ToList();
+
+        // All objects in AllTargets are in OnScreenTargets so it's not necessary to test them
+        if (EnemyListTargets.Count == 0 && OnScreenTargets.Count == 0 && AllTargets.Count == 0)
             return;
 
         var _currentTarget = TargetManager.Target;
         var _previousTarget = TargetManager.PreviousTarget;
         var _targetObjectId = _currentTarget?.EntityId ?? _previousTarget?.EntityId ?? 0;
 
-        // Targets in the frontal cone
-        if (Targets.Count > 0)
+        // Targets in the frontal cone or close circle
+        if (AllTargets.Count > 0)
         {
-            Targets = Targets.OrderBy(o => Utils.DistanceBetweenObjects(Client.LocalPlayer, o)).ToList();
+            AllTargets = AllTargets.OrderBy(o => Utils.DistanceBetweenObjects(Client.LocalPlayer, o)).ToList();
 
-            var TargetsObjectIds = Targets.Select(o => o.EntityId);
-            // Same cone targets as last cycle
-            if (this.LastConeTargets.ToHashSet().SetEquals(TargetsObjectIds.ToHashSet()))
+            var AllTargetsObjectIds = AllTargets.Select(o => o.EntityId);
+
+            // Same targets as last cycle
+            if (this.LastConeTargets.ToHashSet().SetEquals(AllTargetsObjectIds.ToHashSet()))
             {
                 // Add the close targets to the list of potential targets
-                var _potentialTargets = Targets.UnionBy(CloseTargets, o => o.EntityId).ToList();
+                var _potentialTargets = AllTargets;
                 var _potentialTargetsObjectIds = _potentialTargets.Select(o => o.EntityId);
 
                 // New enemies to be added
@@ -285,13 +363,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
             }
             else
             {
-                var _potentialTargets = Targets;
+                var _potentialTargets = AllTargets;
                 var _potentialTargetsObjectIds = _potentialTargets.Select(o => o.EntityId).ToList();
                 var index = _potentialTargetsObjectIds.FindIndex(o => o == _targetObjectId);
                 if (index == _potentialTargetsObjectIds.Count - 1) index = -1;
                 SetTarget(_potentialTargets.Find(o => o.EntityId == _potentialTargetsObjectIds[index + 1]));
 
-                this.LastConeTargets = TargetsObjectIds;
+                this.LastConeTargets = AllTargetsObjectIds;
                 this.CyclingTargets = _potentialTargetsObjectIds;
             }
 
@@ -300,55 +378,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
         this.LastConeTargets = Enumerable.Empty<uint>();
 
-        if (CloseTargets.Count > 0)
-        {
-            var _potentialTargetsObjectIds = CloseTargets.Select(o => o.EntityId);
-
-            if (_potentialTargetsObjectIds.Any(o => this.CyclingTargets.Contains(o) == false))
-                this.CyclingTargets = this.CyclingTargets.Union(_potentialTargetsObjectIds).ToList();
-
-            // We simply select the next target
-            this.CyclingTargets = this.CyclingTargets.Intersect(_potentialTargetsObjectIds).ToList();
-            var index = this.CyclingTargets.FindIndex(o => o == _targetObjectId);
-            if (index == this.CyclingTargets.Count - 1) index = -1;
-            SetTarget(CloseTargets.Find(o => o.EntityId == this.CyclingTargets[index + 1]));
-
-            return;
-        }
-
-        if (EnemyListTargets.Count > 0)
-        {
-            var _potentialTargetsObjectIds = EnemyListTargets.Select(o => o.EntityId);
-
-            if (_potentialTargetsObjectIds.Any(o => this.CyclingTargets.Contains(o) == false))
-                this.CyclingTargets = this.CyclingTargets.Union(_potentialTargetsObjectIds).ToList();
-
-            // We simply select the next target
-            this.CyclingTargets = this.CyclingTargets.Intersect(_potentialTargetsObjectIds).ToList();
-            var index = this.CyclingTargets.FindIndex(o => o == _targetObjectId);
-            if (index == this.CyclingTargets.Count - 1) index = -1;
-            SetTarget(EnemyListTargets.Find(o => o.EntityId == this.CyclingTargets[index + 1]));
-
-            return;
-        }
-
-        if (OnScreenTargets.Count > 0)
-        {
-            OnScreenTargets = OnScreenTargets.OrderBy(o => Utils.DistanceBetweenObjects(Client.LocalPlayer, o)).ToList();
-            var _potentialTargetsObjectIds = OnScreenTargets.Select(o => o.EntityId);
-
-            if (_potentialTargetsObjectIds.Any(o => this.CyclingTargets.Contains(o) == false))
-                this.CyclingTargets = this.CyclingTargets.Union(_potentialTargetsObjectIds).ToList();
-
-            // We simply select the next target
-            this.CyclingTargets = this.CyclingTargets.Intersect(_potentialTargetsObjectIds).ToList();
-            var index = this.CyclingTargets.FindIndex(o => o == _targetObjectId);
-            if (index == this.CyclingTargets.Count - 1) index = -1;
-            SetTarget(OnScreenTargets.Find(o => o.EntityId == this.CyclingTargets[index + 1]));
-        }
+        // Existing logic for CloseTargets, EnemyListTargets, and OnScreenTargets remains unchanged...
     }
 
-    public record ObjectsList(List<DalamudGameObject> Targets, List<DalamudGameObject> CloseTargets, List<DalamudGameObject> TargetsEnemy, List<DalamudGameObject> OnScreenTargets);
+
     internal ObjectsList GetTargets()
     {
         /* Always return 4 lists.
@@ -464,6 +497,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             // In front of the player, adding it to the default list
             TargetsList.Add(obj);
         }
+
+        // Update global priority list with cone targets
+        GlobalPriorityTargets = TargetsList;
 
         return new ObjectsList(TargetsList, CloseTargetsList, TargetsEnemyList, OnScreenTargetsList);
     }

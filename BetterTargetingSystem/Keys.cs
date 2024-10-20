@@ -51,9 +51,9 @@ public unsafe class Keybind
 
     public bool IsPressed()
     {
-        if (this.Key == null)
-            return false;
-
+        if (this.Key == null) { 
+        return false;
+    }
         if (this.ControlModifier != Plugin.KeyState[(int) VirtualKey.CONTROL]
             || this.ShiftModifier != Plugin.KeyState[(int) VirtualKey.SHIFT]
             || this.AltModifier != Plugin.KeyState[(int) VirtualKey.MENU])
